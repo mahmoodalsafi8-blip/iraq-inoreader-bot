@@ -27,7 +27,12 @@ TAG_CHECKED = "user/-/label/checked-iraq"  # every item the bot has handled
 TAG_SENT = "user/-/label/sent-iraq"        # items actually posted to Telegram
 
 LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS") or 3)
-MAX_AI_PER_RUN = int(os.environ.get("MAX_AI_PER_RUN") or 15)
+MAX_AI_PER_RUN = int(os.environ.get("MAX_AI_PER_RUN") or 40)
+MAX_POSTS_PER_RUN = int(os.environ.get("MAX_POSTS_PER_RUN") or 20)
+POST_GAP_SECONDS = float(os.environ.get("POST_GAP_SECONDS") or 2.5)
+# Stop posting after this many seconds so a run stays near one billed minute.
+# Relevant items not posted in time are kept for the next run.
+TIME_BUDGET_SECONDS = float(os.environ.get("TIME_BUDGET_SECONDS") or 75)
 MAX_PAGES = 3                               # up to 300 new items per run
 DRY_RUN = (os.environ.get("DRY_RUN") or "false").lower() == "true"
 
@@ -314,6 +319,7 @@ def main():
     checked = [it["id"] for it in not_iraq]
     sent = []
     skipped = 0
+    postponed = 0
     for item, ai in zip(to_ai, results):
         if ai is None:
             continue  # DeepSeek failed: try again next run
@@ -321,15 +327,19 @@ def main():
             checked.append(item["id"])
             skipped += 1
             continue
+        if len(sent) >= MAX_POSTS_PER_RUN or time.time() - started > TIME_BUDGET_SECONDS:
+            postponed += 1  # not tagged: it will be posted in the next run
+            continue
         post = build_post(item, ai, channel)
         if DRY_RUN:
             print("-" * 40 + "\n" + post)
+            sent.append(item["id"])
             continue
         result = send_telegram(post)
         if result == "ok":
             sent.append(item["id"])
             checked.append(item["id"])
-            time.sleep(1.1)  # stay under Telegram's per-channel speed limit
+            time.sleep(POST_GAP_SECONDS)  # Telegram allows ~20 posts/minute per channel
         elif result == "bad":
             checked.append(item["id"])
 
@@ -338,7 +348,7 @@ def main():
         add_tag(access, sent, TAG_SENT)
 
     print(f"Posted: {len(sent)} | judged not about Iraq: {skipped} | "
-          f"time: {time.time() - started:.1f}s")
+          f"postponed to next run: {postponed} | time: {time.time() - started:.1f}s")
 
 
 if __name__ == "__main__":
