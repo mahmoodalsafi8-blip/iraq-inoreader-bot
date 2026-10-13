@@ -1,30 +1,37 @@
 name: Iraq News Bot
 
 on:
-  # Started every 30 minutes by cron-job.org (or by hand from the Actions tab)
+  # Started every 15 minutes by cron-job.org (or by hand from the Actions tab)
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Test only: show posts in the log, do not post or tag"
+        description: "Test only: show posts in the log, do not post or save"
         type: boolean
         default: false
-      lookback_hours:
-        description: "How many hours back to look for news"
-        type: string
-        default: "3"
 
 # Never run two copies at the same time
 concurrency:
   group: iraq-news-bot
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write   # to clean up old saved states
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Get code
         uses: actions/checkout@v4
+
+      - name: Load saved state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
 
       - name: Run bot
         env:
@@ -35,8 +42,14 @@ jobs:
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
-          LOOKBACK_HOURS: ${{ inputs.lookback_hours || '3' }}
         run: python3 bot.py
+
+      - name: Save state
+        if: always() && hashFiles('state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: bot-state-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Save renewed Inoreader token
         if: always()
@@ -53,3 +66,15 @@ jobs:
             rm -f "$FILE"
             echo "Renewed Inoreader token saved to Secrets."
           fi
+
+      - name: Clean up old saved states
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key bot-state- --sort created_at --order desc \
+            --limit 100 --json id --jq '.[5:][].id' |
+          while read -r id; do
+            gh cache delete "$id" --repo "$GITHUB_REPOSITORY" || true
+          done
