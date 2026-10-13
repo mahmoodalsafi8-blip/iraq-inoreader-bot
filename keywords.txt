@@ -1,0 +1,134 @@
+# کلیدواژه‌های فیلتر اولیه اخبار عراق
+# هر خط یک کلمه. خطوطی که با # شروع شوند نادیده گرفته می‌شوند.
+# فرقی بین ی/ي ، ک/ك ، ه/ة و همزه‌ها نیست؛ ربات خودش یکسان‌سازی می‌کند.
+# کلمات انگلیسی از ابتدای کلمه بررسی می‌شوند (Iraq با Iraqi هم مطابقت دارد).
+
+# ---- نام کشور
+عراق
+عێراق
+Iraq
+
+# ---- شهرها و استان‌ها
+بغداد
+Baghdad
+اربیل
+اربيل
+هەولێر
+Erbil
+Arbil
+بصره
+البصره
+Basra
+Basrah
+موصل
+Mosul
+نجف
+Najaf
+کربلا
+كربلاء
+Karbala
+کرکوک
+Kirkuk
+سلیمانیه
+السليمانيه
+سلێمانی
+Sulaymaniyah
+Sulaimani
+دهوک
+دهوك
+Duhok
+Dohuk
+الانبار
+Anbar
+فلوجه
+Fallujah
+رمادی
+Ramadi
+سامرا
+Samarra
+تکریت
+Tikrit
+دیالی
+Diyala
+بعقوبه
+ناصریه
+الناصريه
+Nasiriyah
+حلبچه
+Halabja
+سنجار
+Sinjar
+نینوا
+نينوى
+Nineveh
+Ninawa
+صلاح الدين
+Salahuddin
+میسان
+Maysan
+ذی قار
+ذي قار
+Dhi Qar
+الحله
+Hillah
+Babil
+الديوانيه
+Diwaniyah
+السماوه
+Samawah
+
+# ---- اقلیم کردستان
+اقلیم کردستان
+اقليم كردستان
+هەرێمی کوردستان
+Kurdistan Region
+KRG
+Peshmerga
+پیشمرگه
+البيشمركه
+
+# ---- نهادها و گروه‌ها
+حشد شعبی
+الحشد
+Popular Mobilization
+PMF
+PMU
+کتائب حزب الله
+Kataib Hezbollah
+عصائب
+Asaib
+النجباء
+Nujaba
+الاطار التنسيقي
+Coordination Framework
+چارچوب هماهنگی
+التيار الصدري
+جریان صدر
+Sadrist
+مقتدی صدر
+مقتدى الصدر
+Muqtada
+Sadr
+
+# ---- چهره‌ها
+السوداني
+سودانی
+Sudani
+بارزانی
+البارزاني
+Barzani
+طالبانی
+الطالباني
+Talabani
+السیستانی
+السيستاني
+سیستانی
+Sistani
+المالكي
+مالکی
+Maliki
+الحلبوسي
+حلبوسی
+Halbousi
+عبد اللطيف رشيد
+Abdul Latif Rashid
