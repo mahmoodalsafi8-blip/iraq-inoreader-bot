@@ -179,6 +179,59 @@ def fetch_new_items(access):
     return items
 
 
+_BAD_IMAGE = re.compile(
+    r"(pixel|tracking|feedburner|doubleclick|1x1|spacer|blank\.|logo|icon|avatar|emoji|"
+    r"gravatar|\.svg|\.gif)", re.I)
+
+
+def good_image(url):
+    url = html.unescape((url or "").strip())
+    if url.startswith("//"):
+        url = "https:" + url
+    if not url.startswith("http") or _BAD_IMAGE.search(url):
+        return ""
+    return url
+
+
+def image_from_feed(raw):
+    for enc in raw.get("enclosure") or []:
+        if str(enc.get("type", "")).startswith("image"):
+            url = good_image(enc.get("href"))
+            if url:
+                return url
+    content = (raw.get("summary") or {}).get("content", "")
+    for tag in re.findall(r"<img\b[^>]*>", content, flags=re.I):
+        m = re.search(r'\ssrc\s*=\s*["\']([^"\']+)', tag, flags=re.I)
+        w = re.search(r'\swidth\s*=\s*["\']?(\d+)', tag, flags=re.I)
+        if w and int(w.group(1)) < 100:
+            continue  # tiny images are icons or trackers
+        url = good_image(m.group(1)) if m else ""
+        if url:
+            return url
+    return ""
+
+
+def image_from_page(link):
+    """Read og:image / twitter:image from the article page (first 300 KB only)."""
+    if not link:
+        return ""
+    req = urllib.request.Request(link, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            page = resp.read(300_000).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    for meta in re.findall(r"<meta\b[^>]*>", page, flags=re.I):
+        if re.search(r'(property|name)\s*=\s*["\'](og:image|twitter:image)(:src)?["\']', meta, re.I):
+            m = re.search(r'content\s*=\s*["\']([^"\']+)', meta, flags=re.I)
+            url = good_image(urllib.parse.urljoin(link, html.unescape(m.group(1)))) if m else ""
+            if url:
+                return url
+    return ""
+
+
 def parse_item(raw):
     link = ""
     for key in ("canonical", "alternate"):
@@ -193,6 +246,7 @@ def parse_item(raw):
         "link": link,
         "source": strip_html((raw.get("origin") or {}).get("title", "")),
         "published": raw.get("published", 0),
+        "image": image_from_feed(raw),
     }
 
 
@@ -207,33 +261,76 @@ def add_tag(access, ids, tag):
 
 
 # ------------------------------------------------------------------ deepseek
-def ask_deepseek(item):
-    user_msg = (
-        f"Source: {item['source']}\n"
-        f"Headline: {item['title']}\n"
-        f"Text: {item['text'][:3000]}"
-    )
+_PERSIAN_WORDS = re.compile(r"(^|\s)(است|این|را|که|از|به|با|برای|می|شد|شده|کرد|های|هایی|خود|نیز|اما)(\s|‌|$)")
+_ARABIC_WORDS = re.compile(r"(^|\s)(في|على|التي|الذي|إلى|الى|هذا|هذه|عن|قد|كان|لم|ان|أن|وقال)(\s|$)")
+_KURDISH_LETTERS = re.compile(r"[ەێۆڕڵ]")
+
+
+def looks_persian(ai):
+    """True if DeepSeek's answer is really in Persian (not Arabic, Kurdish or English)."""
+    text = " ".join([str(ai.get("title", "")), str(ai.get("summary", ""))] +
+                    [str(p) for p in ai.get("key_points") or []])
+    letters = re.findall(r"[A-Za-z؀-ۿ]", text)
+    if not letters:
+        return False
+    latin = sum(1 for c in letters if c.isascii())
+    if latin / len(letters) > 0.25:
+        return False                       # mostly English
+    if len(_KURDISH_LETTERS.findall(text)) > 3:
+        return False                       # Kurdish (Sorani)
+    persian = len(_PERSIAN_WORDS.findall(text)) + len(re.findall(r"[پچژگ]", text))
+    arabic = len(_ARABIC_WORDS.findall(text))
+    return persian >= 2 and persian > arabic
+
+
+def _deepseek_call(messages):
     payload = {
         "model": DEEPSEEK_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
+        "messages": messages,
         "response_format": {"type": "json_object"},
-        "temperature": 0.3,
-        "max_tokens": 800,
+        "temperature": 0.2,
+        "max_tokens": 900,
     }
     status, raw = http("POST", DEEPSEEK_URL, data=payload, as_json=True, timeout=45,
                        headers={"Authorization": f"Bearer {need('DEEPSEEK_API_KEY')}"})
     if status != 200:
-        print(f"WARNING: DeepSeek error ({status}) for '{item['title'][:60]}': {raw[:200]}")
-        return None
+        raise RuntimeError(f"DeepSeek error ({status}): {raw[:200]}")
+    content = json.loads(raw)["choices"][0]["message"]["content"]
+    return content, json.loads(content)
+
+
+def ask_deepseek(item):
+    user_msg = (
+        f"Source: {item['source']}\n"
+        f"Headline: {item['title']}\n"
+        f"Text: {item['text'][:3000]}\n\n"
+        "IMPORTANT: title, summary and key_points MUST be written in Persian (Farsi), "
+        "never in Arabic, Kurdish or English, even if the source text is in that language."
+    )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
     try:
-        content = json.loads(raw)["choices"][0]["message"]["content"]
-        return json.loads(content)
+        content, ai = _deepseek_call(messages)
+        if ai.get("relevant") and not looks_persian(ai):
+            # Second chance: ask DeepSeek to fix its own answer
+            messages += [
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": "Your answer is not in Persian. Translate title, summary "
+                                            "and key_points into fluent Persian (Farsi) and reply "
+                                            "with the same json shape."},
+            ]
+            content, ai = _deepseek_call(messages)
+            if ai.get("relevant") and not looks_persian(ai):
+                print(f"SKIP (not translated to Persian): {item['title'][:70]}")
+                ai = {"relevant": False}
     except Exception as e:
-        print(f"WARNING: bad DeepSeek reply for '{item['title'][:60]}': {e}")
+        print(f"WARNING: DeepSeek failed for '{item['title'][:60]}': {e}")
         return None
+    if ai.get("relevant") and not item["image"]:
+        item["image"] = image_from_page(item["link"])
+    return ai
 
 
 # ------------------------------------------------------------------ telegram
@@ -262,17 +359,11 @@ def build_post(item, ai, channel):
     return "\n".join(lines)
 
 
-def send_telegram(text):
-    """Returns 'ok', 'bad' (will never work, skip it) or 'retry' (try next run)."""
-    url = f"https://api.telegram.org/bot{need('TELEGRAM_BOT_TOKEN')}/sendMessage"
-    data = {
-        "chat_id": need("TELEGRAM_CHANNEL"),
-        "text": text,
-        "parse_mode": "HTML",
-        "link_preview_options": json.dumps({"is_disabled": True}),
-    }
+def _telegram(method, data):
+    """Returns 'ok', 'bad' (Telegram refused it) or 'retry' (try next run)."""
+    url = f"https://api.telegram.org/bot{need('TELEGRAM_BOT_TOKEN')}/{method}"
     for _ in range(3):
-        status, raw = http("POST", url, data=data, timeout=20)
+        status, raw = http("POST", url, data=data, timeout=30)
         if status == 200:
             return "ok"
         if status == 429:
@@ -282,9 +373,34 @@ def send_telegram(text):
                 wait = 5
             time.sleep(min(int(wait), 30))
             continue
-        print(f"WARNING: Telegram error ({status}): {raw[:300]}")
+        print(f"WARNING: Telegram {method} error ({status}): {raw[:300]}")
         return "bad" if status == 400 else "retry"
     return "retry"
+
+
+def visible_length(post):
+    return len(html.unescape(re.sub(r"<[^>]+>", "", post)))
+
+
+def send_telegram(text, image=""):
+    chat = need("TELEGRAM_CHANNEL")
+    if image:
+        if visible_length(text) <= 1024:
+            # Photo with the post as its caption
+            result = _telegram("sendPhoto", {
+                "chat_id": chat, "photo": image, "caption": text, "parse_mode": "HTML"})
+        else:
+            # Too long for a caption: big image preview above the text
+            result = _telegram("sendMessage", {
+                "chat_id": chat, "text": text, "parse_mode": "HTML",
+                "link_preview_options": json.dumps({
+                    "url": image, "prefer_large_media": True, "show_above_text": True})})
+        if result != "bad":
+            return result
+        print("Image rejected by Telegram, posting text only.")
+    return _telegram("sendMessage", {
+        "chat_id": chat, "text": text, "parse_mode": "HTML",
+        "link_preview_options": json.dumps({"is_disabled": True})})
 
 
 # ---------------------------------------------------------------------- main
@@ -332,10 +448,10 @@ def main():
             continue
         post = build_post(item, ai, channel)
         if DRY_RUN:
-            print("-" * 40 + "\n" + post)
+            print("-" * 40 + f"\n[image: {item['image'] or 'none'}]\n" + post)
             sent.append(item["id"])
             continue
-        result = send_telegram(post)
+        result = send_telegram(post, item["image"])
         if result == "ok":
             sent.append(item["id"])
             checked.append(item["id"])
