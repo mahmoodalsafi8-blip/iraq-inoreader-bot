@@ -37,22 +37,37 @@ MAX_PAGES = 3                               # up to 300 new items per run
 DRY_RUN = (os.environ.get("DRY_RUN") or "false").lower() == "true"
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat"
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-pro"
 
 KEYWORDS_FILE = Path(__file__).with_name("keywords.txt")
 
-SYSTEM_PROMPT = """You are the news editor of a Persian-language Telegram channel that covers Iraq.
-You receive one news item (any language: Arabic, English, Kurdish, Persian, ...).
+SYSTEM_PROMPT = """You are the senior news editor of a Persian-language Telegram channel that covers Iraq.
+You receive ONE news item: its headline, link and text (any language: Arabic, English, Kurdish, Persian...).
 
-1) Decide if the item is really about Iraq: Iraqi politics, government, security, economy,
-   society, the Kurdistan Region of Iraq, Iraqi groups and figures, or Iraq's foreign relations.
-   A passing mention of Iraq inside a story about something else is NOT relevant.
-2) If relevant, write in fluent, formal, journalistic Persian (Farsi):
-   - "title": a clear news headline, at most 15 words
-   - "summary": 2 to 3 sentences
-   - "key_points": 2 to 4 short bullet points
-   Use standard Persian spellings of names and places. Use only facts present in the text.
-   Do not add opinions or information that is not in the source.
+ACCURACY RULES (most important):
+- The HEADLINE defines the story. Write only about that one story.
+- The text may also contain other stories, menus, "related news", ads or page leftovers.
+  Ignore everything in the text that is not about the headline's story.
+- Use only facts that are in the source. Never add, guess or mix in information.
+- If the text does not match the headline, use only what the headline says.
+
+STEP 1: Is the story really about Iraq? (Iraqi politics, government, security, economy, society,
+the Kurdistan Region of Iraq, Iraqi groups and figures, or Iraq's foreign relations.)
+A passing mention of Iraq inside a story about something else is NOT relevant.
+
+STEP 2: If relevant, write in fluent, natural, formal Persian, in the style of a professional
+Iranian news agency (like IRNA or ISNA). This is not word-by-word translation: rewrite it as
+good Persian journalism.
+- "title": a clear Persian news headline, at most 15 words
+- "summary": 2 to 3 Persian sentences: who, what, where, when
+- "key_points": 2 to 4 short Persian bullet points with the most important facts
+Persian style rules:
+- Use Persian vocabulary and sentence order, not Arabic structure.
+  Example: write "نخست‌وزیر عراق" not "رئیس الوزراء العراقی"; "اقلیم کردستان" not "اقليم كوردستان".
+- Use the usual Persian forms of names: محمد شیاع السودانی، مسعود بارزانی، مقتدی صدر، آیت‌الله سیستانی،
+  الحشد الشعبی، بغداد، اربیل، سلیمانیه، بصره، نجف، کربلا، موصل، کرکوک.
+- Use Persian letters (ی، ک) and the half-space (‌) where needed (می‌شود، گفت‌وگو).
+- Every field must be in Persian, never in Arabic, Kurdish or English.
 
 Reply ONLY with a json object in exactly this shape:
 {"relevant": true, "title": "...", "summary": "...", "key_points": ["...", "..."]}
@@ -181,7 +196,8 @@ def fetch_new_items(access):
 
 _BAD_IMAGE = re.compile(
     r"(pixel|tracking|feedburner|doubleclick|1x1|spacer|blank\.|logo|icon|avatar|emoji|"
-    r"gravatar|\.svg|\.gif)", re.I)
+    r"gravatar|default|placeholder|fallback|no[-_]?image|share[-_]?image|banner|sprite|"
+    r"\.svg|\.gif)", re.I)
 
 
 def good_image(url):
@@ -194,26 +210,34 @@ def good_image(url):
 
 
 def image_from_feed(raw):
+    """Only the image the feed attached to THIS item (enclosure).
+    Images inside the feed text are not used: they often belong to other stories."""
     for enc in raw.get("enclosure") or []:
         if str(enc.get("type", "")).startswith("image"):
             url = good_image(enc.get("href"))
             if url:
                 return url
-    content = (raw.get("summary") or {}).get("content", "")
-    for tag in re.findall(r"<img\b[^>]*>", content, flags=re.I):
-        m = re.search(r'\ssrc\s*=\s*["\']([^"\']+)', tag, flags=re.I)
-        w = re.search(r'\swidth\s*=\s*["\']?(\d+)', tag, flags=re.I)
-        if w and int(w.group(1)) < 100:
-            continue  # tiny images are icons or trackers
-        url = good_image(m.group(1)) if m else ""
-        if url:
-            return url
     return ""
+
+
+# Links that are not a single article page: their page image would be a logo or another story
+_NOT_ARTICLE_HOSTS = ("news.google.", "google.com", "bing.com", "msn.com", "feedproxy.",
+                      "feeds.", "rss.", "t.me/s/")
+
+
+def is_article_link(link):
+    if not link:
+        return False
+    parts = urllib.parse.urlparse(link)
+    if any(h in (parts.netloc + parts.path) for h in _NOT_ARTICLE_HOSTS):
+        return False
+    path = parts.path.strip("/")
+    return len(path) > 3 or bool(parts.query)  # homepage-like links are not articles
 
 
 def image_from_page(link):
     """Read og:image / twitter:image from the article page (first 300 KB only)."""
-    if not link:
+    if not is_article_link(link):
         return ""
     req = urllib.request.Request(link, headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -239,10 +263,16 @@ def parse_item(raw):
             link = raw[key][0].get("href", "")
             if link:
                 break
+    content = (raw.get("summary") or {}).get("content", "")
+    text = strip_html(content)
+    # Google News and other digest feeds put several different stories in one item:
+    # then only the headline is trustworthy.
+    if "news.google." in link or len(re.findall(r"<a\s", content, flags=re.I)) >= 4:
+        text = ""
     return {
         "id": raw["id"],
         "title": strip_html(raw.get("title", "")),
-        "text": strip_html((raw.get("summary") or {}).get("content", "")),
+        "text": text,
         "link": link,
         "source": strip_html((raw.get("origin") or {}).get("title", "")),
         "published": raw.get("published", 0),
@@ -291,7 +321,7 @@ def _deepseek_call(messages):
         "temperature": 0.2,
         "max_tokens": 900,
     }
-    status, raw = http("POST", DEEPSEEK_URL, data=payload, as_json=True, timeout=45,
+    status, raw = http("POST", DEEPSEEK_URL, data=payload, as_json=True, timeout=60,
                        headers={"Authorization": f"Bearer {need('DEEPSEEK_API_KEY')}"})
     if status != 200:
         raise RuntimeError(f"DeepSeek error ({status}): {raw[:200]}")
@@ -303,7 +333,8 @@ def ask_deepseek(item):
     user_msg = (
         f"Source: {item['source']}\n"
         f"Headline: {item['title']}\n"
-        f"Text: {item['text'][:3000]}\n\n"
+        f"Link: {item['link']}\n"
+        f"Text: {item['text'][:3000] or '(no text, use the headline only)'}\n\n"
         "IMPORTANT: title, summary and key_points MUST be written in Persian (Farsi), "
         "never in Arabic, Kurdish or English, even if the source text is in that language."
     )
@@ -429,7 +460,7 @@ def main():
 
     results = []
     if to_ai:
-        with ThreadPoolExecutor(max_workers=min(15, len(to_ai))) as pool:
+        with ThreadPoolExecutor(max_workers=min(20, len(to_ai))) as pool:
             results = list(pool.map(ask_deepseek, to_ai))
 
     checked = [it["id"] for it in not_iraq]
@@ -451,6 +482,8 @@ def main():
             print("-" * 40 + f"\n[image: {item['image'] or 'none'}]\n" + post)
             sent.append(item["id"])
             continue
+        print(f"POST | {item['source']} | {item['title'][:70]} | link: {item['link']} | "
+              f"image: {item['image'] or 'none'}")
         result = send_telegram(post, item["image"])
         if result == "ok":
             sent.append(item["id"])
