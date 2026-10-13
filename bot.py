@@ -3,8 +3,11 @@
 Iraq News Bot
 Inoreader (folder "Iraq") -> keyword filter -> DeepSeek (Persian) -> Telegram channel
 
-Uses only the Python standard library (no pip install), so each GitHub Actions
-run stays fast and well under one billed minute.
+Uses only the Python standard library (no pip install).
+
+Inoreader allows only 100 API calls a day per zone, so each run makes exactly ONE
+Inoreader read call and NO write calls. What has been seen / is waiting to be posted
+is kept in state.json, which GitHub Actions keeps between runs (actions/cache).
 """
 
 import html
@@ -23,17 +26,18 @@ from pathlib import Path
 INOREADER = "https://www.inoreader.com"
 FOLDER = os.environ.get("INOREADER_FOLDER") or "Iraq"
 STREAM_ID = f"user/-/label/{FOLDER}"
-TAG_CHECKED = "user/-/label/checked-iraq"  # every item the bot has handled
-TAG_SENT = "user/-/label/sent-iraq"        # items actually posted to Telegram
+STATE_FILE = Path(os.environ.get("STATE_FILE") or "state.json")
 
-LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS") or 3)
+FIRST_RUN_HOURS = float(os.environ.get("FIRST_RUN_HOURS") or 0.5)  # how far back on the very first run
+OVERLAP_SECONDS = 900          # re-read the last 15 min each run so late items are not missed
+QUEUE_MAX_AGE_HOURS = 8        # drop waiting items older than this
+SEEN_KEEP_DAYS = 3
 MAX_AI_PER_RUN = int(os.environ.get("MAX_AI_PER_RUN") or 40)
 MAX_POSTS_PER_RUN = int(os.environ.get("MAX_POSTS_PER_RUN") or 20)
 POST_GAP_SECONDS = float(os.environ.get("POST_GAP_SECONDS") or 2.5)
 # Stop posting after this many seconds so a run stays near one billed minute.
 # Relevant items not posted in time are kept for the next run.
 TIME_BUDGET_SECONDS = float(os.environ.get("TIME_BUDGET_SECONDS") or 75)
-MAX_PAGES = 3                               # up to 300 new items per run
 DRY_RUN = (os.environ.get("DRY_RUN") or "false").lower() == "true"
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -82,6 +86,9 @@ def need(name):
     return value
 
 
+LAST_HEADERS = {}
+
+
 def http(method, url, data=None, headers=None, timeout=30, as_json=False):
     """Small HTTP helper. Returns (status_code, response_text)."""
     headers = dict(headers or {})
@@ -96,8 +103,14 @@ def http(method, url, data=None, headers=None, timeout=30, as_json=False):
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if "inoreader.com/reader" in url:
+                LAST_HEADERS.clear()
+                LAST_HEADERS.update({k.lower(): v for k, v in resp.headers.items()})
             return resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
+        if "inoreader.com/reader" in url:
+            LAST_HEADERS.clear()
+            LAST_HEADERS.update({k.lower(): v for k, v in e.headers.items()})
         return e.code, e.read().decode("utf-8", "replace")
     except Exception as e:  # timeout, DNS, connection reset...
         return 0, str(e)
@@ -173,25 +186,27 @@ def get_access_token():
     return access
 
 
-def fetch_new_items(access):
-    headers = {"Authorization": f"Bearer {access}"}
-    since = int(time.time() - LOOKBACK_HOURS * 3600)
+def fetch_new_items(access, since):
+    """ONE Inoreader call: up to 100 items added to the folder after `since`, oldest first.
+    Returns (items, next_checkpoint) or (None, since) if Inoreader refused."""
     stream = urllib.parse.quote(STREAM_ID, safe="")
-    items, continuation = [], None
-    for _ in range(MAX_PAGES):
-        query = {"n": 100, "xt": TAG_CHECKED, "ot": since}
-        if continuation:
-            query["c"] = continuation
-        url = f"{INOREADER}/reader/api/0/stream/contents/{stream}?{urllib.parse.urlencode(query)}"
-        status, raw = http("GET", url, headers=headers)
-        if status != 200:
-            sys.exit(f"ERROR: could not read folder '{FOLDER}' ({status}): {raw[:300]}")
-        data = json.loads(raw)
-        items.extend(data.get("items", []))
-        continuation = data.get("continuation")
-        if not continuation:
-            break
-    return items
+    query = {"n": 100, "r": "o", "ot": int(since)}
+    url = f"{INOREADER}/reader/api/0/stream/contents/{stream}?{urllib.parse.urlencode(query)}"
+    status, raw = http("GET", url, headers={"Authorization": f"Bearer {access}"})
+    used, limit = LAST_HEADERS.get("x-reader-zone1-usage"), LAST_HEADERS.get("x-reader-zone1-limit")
+    if used and limit:
+        print(f"Inoreader API used today: {used}/{limit}")
+    if status != 200:
+        print(f"WARNING: could not read folder '{FOLDER}' ({status}): {raw[:300]}")
+        if status == 429:
+            print("WARNING: Inoreader daily API limit reached. Waiting items will still be posted.")
+        return None, since
+    items = json.loads(raw).get("items", [])
+    if len(items) >= 100:
+        # More items are waiting: continue next run from the last one we got
+        newest = max(int(x.get("crawlTimeMsec") or 0) // 1000 for x in items)
+        return items, max(newest, since + 1)
+    return items, time.time()
 
 
 _BAD_IMAGE = re.compile(
@@ -280,14 +295,23 @@ def parse_item(raw):
     }
 
 
-def add_tag(access, ids, tag):
-    headers = {"Authorization": f"Bearer {access}"}
-    for i in range(0, len(ids), 100):
-        chunk = ids[i:i + 100]
-        data = [("a", tag)] + [("i", item_id) for item_id in chunk]
-        status, raw = http("POST", f"{INOREADER}/reader/api/0/edit-tag", data=data, headers=headers)
-        if status != 200:
-            print(f"WARNING: tagging failed ({status}): {raw[:200]}")
+# --------------------------------------------------------------------- state
+def load_state():
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        print(f"State loaded: {len(state.get('queue', []))} items waiting, "
+              f"{len(state.get('seen', {}))} known items")
+        return state
+    except Exception:
+        print(f"No saved state: first run, starting {FIRST_RUN_HOURS} hours back.")
+        return {"checkpoint": time.time() - FIRST_RUN_HOURS * 3600, "seen": {}, "queue": []}
+
+
+def save_state(state):
+    now = time.time()
+    state["seen"] = {k: v for k, v in state["seen"].items() if now - v < SEEN_KEEP_DAYS * 86400}
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    print(f"State saved: {len(state['queue'])} items waiting for next run.")
 
 
 # ------------------------------------------------------------------ deepseek
@@ -442,63 +466,85 @@ def main():
         need(name)
     channel = need("TELEGRAM_CHANNEL")
     if DRY_RUN:
-        print("*** DRY RUN: nothing will be posted or tagged ***")
+        print("*** DRY RUN: nothing will be posted or saved ***")
 
     patterns = load_keywords()
+    state = load_state()
     access = get_access_token()
 
-    items = [parse_item(x) for x in fetch_new_items(access)]
-    unique = {it["id"]: it for it in items}
-    items = sorted(unique.values(), key=lambda it: it["published"])  # oldest first
-
-    candidates = [it for it in items if is_iraq_candidate(it, patterns)]
-    not_iraq = [it for it in items if not is_iraq_candidate(it, patterns)]
-    to_ai = candidates[:MAX_AI_PER_RUN]
-    later = len(candidates) - len(to_ai)
-    print(f"New items: {len(items)} | keyword match: {len(candidates)} | "
-          f"to DeepSeek now: {len(to_ai)} | left for next run: {later}")
-
-    results = []
-    if to_ai:
-        with ThreadPoolExecutor(max_workers=min(20, len(to_ai))) as pool:
-            results = list(pool.map(ask_deepseek, to_ai))
-
-    checked = [it["id"] for it in not_iraq]
-    sent = []
-    skipped = 0
-    postponed = 0
-    for item, ai in zip(to_ai, results):
-        if ai is None:
-            continue  # DeepSeek failed: try again next run
-        if not ai.get("relevant") or not ai.get("title"):
-            checked.append(item["id"])
-            skipped += 1
+    # 1. One Inoreader call for everything new since the last run
+    since = state["checkpoint"] - OVERLAP_SECONDS
+    raw_items, next_checkpoint = fetch_new_items(access, since)
+    new_items = []
+    for raw in raw_items or []:
+        item_id = raw.get("id")
+        if not item_id or item_id in state["seen"]:
             continue
-        if len(sent) >= MAX_POSTS_PER_RUN or time.time() - started > TIME_BUDGET_SECONDS:
-            postponed += 1  # not tagged: it will be posted in the next run
+        state["seen"][item_id] = time.time()
+        new_items.append(parse_item(raw))
+    candidates = [it for it in new_items if is_iraq_candidate(it, patterns)]
+    for it in candidates:
+        it["added"] = time.time()
+        it["tries"] = 0
+    state["queue"].extend(candidates)
+    state["checkpoint"] = next_checkpoint
+
+    # 2. Drop waiting items that are too old or keep failing
+    now = time.time()
+    queue = [it for it in state["queue"]
+             if now - it.get("added", now) < QUEUE_MAX_AGE_HOURS * 3600 and it.get("tries", 0) < 3]
+    queue.sort(key=lambda it: it.get("published", 0))  # oldest first
+    print(f"New items: {len(new_items)} | keyword match: {len(candidates)} | "
+          f"waiting in total: {len(queue)}")
+
+    # 3. DeepSeek for waiting items that have not been checked yet (in parallel)
+    to_ai = [it for it in queue if "ai" not in it][:MAX_AI_PER_RUN]
+    if to_ai:
+        print(f"Sending {len(to_ai)} items to DeepSeek ({DEEPSEEK_MODEL})")
+        with ThreadPoolExecutor(max_workers=min(20, len(to_ai))) as pool:
+            for item, ai in zip(to_ai, pool.map(ask_deepseek, to_ai)):
+                if ai is None:
+                    item["tries"] = item.get("tries", 0) + 1   # try again next run
+                else:
+                    item["ai"] = ai
+
+    # 4. Post the confirmed items, oldest first
+    keep, sent, skipped, postponed = [], 0, 0, 0
+    for item in queue:
+        ai = item.get("ai")
+        if ai is None:
+            keep.append(item)            # not checked yet
+            continue
+        if not ai.get("relevant") or not ai.get("title"):
+            skipped += 1                 # not about Iraq: forget it
+            continue
+        if sent >= MAX_POSTS_PER_RUN or time.time() - started > TIME_BUDGET_SECONDS:
+            postponed += 1
+            keep.append(item)            # post next run
             continue
         post = build_post(item, ai, channel)
         if DRY_RUN:
-            print("-" * 40 + f"\n[image: {item['image'] or 'none'}]\n" + post)
-            sent.append(item["id"])
+            print("-" * 40 + f"\n[link: {item['link']}]\n[image: {item['image'] or 'none'}]\n" + post)
+            sent += 1
             continue
         print(f"POST | {item['source']} | {item['title'][:70]} | link: {item['link']} | "
               f"image: {item['image'] or 'none'}")
         result = send_telegram(post, item["image"])
         if result == "ok":
-            sent.append(item["id"])
-            checked.append(item["id"])
+            sent += 1
             time.sleep(POST_GAP_SECONDS)  # Telegram allows ~20 posts/minute per channel
-        elif result == "bad":
-            checked.append(item["id"])
+        elif result == "retry":
+            item["tries"] = item.get("tries", 0) + 1
+            keep.append(item)
 
-    if not DRY_RUN:
-        add_tag(access, checked, TAG_CHECKED)
-        add_tag(access, sent, TAG_SENT)
+    state["queue"] = keep
+    if DRY_RUN:
+        print("DRY RUN: state not saved, nothing posted.")
+    else:
+        save_state(state)
 
-    print(f"Posted: {len(sent)} | judged not about Iraq: {skipped} | "
+    print(f"Posted: {sent} | judged not about Iraq: {skipped} | "
           f"postponed to next run: {postponed} | time: {time.time() - started:.1f}s")
-
 
 if __name__ == "__main__":
     main()
